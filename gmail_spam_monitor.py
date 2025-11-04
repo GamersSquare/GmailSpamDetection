@@ -1,18 +1,3 @@
-#!/usr/bin/env python3
-"""
-gmail_spam_monitor.py - Robust version with bug fixes.
-
-Primary changes from previous:
- - Fixed `raw` local-variable bug when saving .eml quarantine copies.
- - Defensive checks for Gmail API responses (explicit None checks).
- - Better exception logging to avoid referencing unassigned locals.
- - Keeps features: OAuth2/Gmail API, model/vectorizer loading, spam prediction,
-   move to SPAM label, quarantine .eml save, predictions CSV, debug token dump.
-
-Requirements:
- pip install --upgrade google-api-python-client google-auth-httplib2 google-auth-oauthlib joblib scikit-learn pandas
-"""
-
 import os
 import re
 import logging
@@ -203,9 +188,6 @@ def add_labels_move_to_spam(service, msg_id: str):
 
 
 def save_eml_quarantine(service, msg_id: str, dest_dir: str = DEBUG_DIR):
-    """
-    Robustly save raw RFC822 (.eml) content. Avoid referencing 'raw' unless it exists.
-    """
     try:
         resp = service.users().messages().get(userId="me", id=msg_id, format="raw").execute()
     except Exception as e:

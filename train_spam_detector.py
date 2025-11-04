@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-"""
-train_spam_detector.py
-
-Usage examples:
-  # Train on default public dataset and save model
-  python train_spam_detector.py --out_dir models
-
-  # Train using your own CSV (must contain either 'text' or 'subject'/'body' plus 'label' for training)
-  python train_spam_detector.py --data path/to/your_emails.csv --out_dir models
-
-  # Predict only (load saved model and vectorizer)
-  python train_spam_detector.py --predict_only --model models/model.joblib --vectorizer models/vectorizer.joblib
-  --test_csv my_email_to_check.csv
-"""
-
 import argparse
 import os
 import sys
@@ -30,13 +14,10 @@ from sklearn.metrics import classification_report, confusion_matrix, accuracy_sc
 import joblib
 
 
-# --------- Utilities and preprocessing (important parts commented) ---------
+# --------- Utilities and preprocessing ---------
 def download_uciml_sms_dataset():
-    """
-    Downloads the UCI SMS Spam Collection dataset (text file).
-    Returns a pandas DataFrame with columns: label (spam/ham), text.
-    Source: UCI ML repository.
-    """
+    # Downloads the UCI SMS Spam Collection dataset (text file).
+    # Returns a pandas DataFrame with columns: label (spam/ham)
     url = "https://archive.ics.uci.edu/ml/machine-learning-databases/00228/smsspamcollection.zip"
     print("Downloading UCI SMS dataset from:", url)
     data = urllib.request.urlopen(url).read()
@@ -49,13 +30,8 @@ def download_uciml_sms_dataset():
 
 
 def load_csv_as_dataframe(path):
-    """
-    Tries to load a CSV and normalizes it to columns ['text','label'] if possible.
-    Accepts CSVs with:
-      - 'text' and 'label', OR
-      - 'subject' and 'body' (will concatenate), and optionally 'label'.
-    If no label column present, returns dataframe with label=None (useful for prediction).
-    """
+    # Tries to load a CSV and normalizes it to columns ['text','label'] if possible.
+    # If no label column present, returns dataframe with label=None (useful for prediction).
     df = pd.read_csv(path)
     # unify text column
     if 'text' in df.columns:
@@ -88,9 +64,9 @@ def load_csv_as_dataframe(path):
 
 
 def simple_preprocess(s):
-    """Lowercase + remove repeated whitespace + strip."""
+    # Lowercase and remove repeated whitespace.
     s = s.lower()
-    # optional: remove email headers / quoted lines (simple heuristic)
+    # Remove email headers / quoted lines (simple heuristic)
     s = re.sub(r'(^>.*$)', ' ', s, flags=re.MULTILINE)
     s = re.sub(r'\s+', ' ', s).strip()
     return s
@@ -148,10 +124,7 @@ def train_and_save(df, out_dir, model_name='model.joblib', vectorizer_name='vect
 
 
 def predict_from_csv(model, vectorizer, csv_path, out_csv=None):
-    """
-    Load a CSV (no label required), runs predictions and prints top examples.
-    Requires the CSV to contain either 'text' or 'subject'/'body' columns — see load_csv_as_dataframe.
-    """
+    # Load a CSV (no label required), runs predictions and prints top examples.
     df = load_csv_as_dataframe(csv_path)
     df['text_proc'] = df['text'].astype(str).map(simple_preprocess)
     X = df['text_proc'].values
