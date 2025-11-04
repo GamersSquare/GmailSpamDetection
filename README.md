@@ -34,3 +34,21 @@ This repository contains two tools:
   python gmail_spam_monitor.py
   ```
   Approve the consent screen in the browser. This creates token.json.
+
+Additionally, if you want to run the script every specified time range:
+   1. Open Task Scheduler (search for it in the Start menu).
+   
+   2. In the right panel, click Create Basic Task…
+   
+   3. Name: GmailSpamMonitor
+      (Optional: description “Checks Gmail for spam every 6 hours”)
+   
+   4. Trigger: choose Daily → set start time (e.g., 08:00)
+      → Repeat task every 6 hours → for a duration of: 1 day.
+      (This repeats continuously every 6 h.)
+   
+   5. Action: choose Start a program, Path to the gmail_spam_monitor.py
+   
+   6. Finish, then open Properties → Settings tab → check
+      ✅ “Run task as soon as possible after a scheduled start is missed”
+      ✅ “Allow task to be run on demand”
