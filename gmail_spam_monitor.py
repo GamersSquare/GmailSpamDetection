@@ -1,43 +1,37 @@
+import pandas as pd
 import os
 import re
 import logging
 import base64
 import joblib
 import html
-import datetime
-from typing import List, Optional, Tuple
-import pandas as pd
-import traceback
+from typing import List, Tuple, Optional
+from email.header import decode_header
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from email.header import decode_header
 from google.auth.transport.requests import Request
-
+from googleapiclient.discovery import build
 
 # ---------- Config ----------
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
-CREDENTIALS_FILE = os.environ.get("GMAIL_OAUTH_CREDENTIALS", "credentials.json")
-TOKEN_FILE = os.environ.get("GMAIL_OAUTH_TOKEN", "token.json")
+CREDENTIALS_FILE = "credentials.json"  # Path to OAuth client JSON
+TOKEN_FILE = "token.json"
 MODEL_PATH = os.environ.get("MODEL_PATH", "models/model.joblib")
 VEC_PATH = os.environ.get("VEC_PATH", "models/vectorizer.joblib")
-PREDICTIONS_CSV = os.environ.get("PRED_CSV", "predictions.csv")
-DEBUG_DIR = os.environ.get("DEBUG_DIR", "gmail_debug")
+PREDICTIONS_CSV = "predictions.csv"
 SPAM_PROB_THRESHOLD = float(os.environ.get("SPAM_PROB_THRESHOLD", 0.5))
-QUARANTINE_SAVE = os.environ.get("QUARANTINE_SAVE", "1") in ("1", "true", "True")
+QUARANTINE_SAVE = True  # saves .eml copies of moved messages
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
 
-# ---------- Helpers ----------
+# ---------- Preprocess (same as trainer) ----------
 def simple_preprocess(s: str) -> str:
     if s is None:
         return ""
-    s = s.lower()
+    s = str(s).lower()
     s = re.sub(r'(^>.*$)', ' ', s, flags=re.MULTILINE)
-    s = re.sub(r'\b(from|sent|to|subject):.*', ' ', s)
     s = re.sub(r'\s+', ' ', s).strip()
     return s
 
@@ -49,7 +43,6 @@ def strip_html_and_unescape(raw_html: str) -> str:
         return raw_html
     raw = re.sub(r'(?is)<(script|style).*?>.*?(</\1>)', ' ', raw_html)
     raw = re.sub(r'(?i)<br\s*/?>', '\n', raw)
-    raw = re.sub(r'(?i)</(p|div|li|tr)>', '\n', raw)
     raw = re.sub(r'<[^>]+>', ' ', raw)
     raw = html.unescape(raw)
     raw = re.sub(r'\s+', ' ', raw).strip()
@@ -72,7 +65,7 @@ def decode_mime_words(s: Optional[str]) -> str:
     return "".join(out)
 
 
-# ---------- Gmail API / OAuth ----------
+# ---------- Gmail API helpers ----------
 def get_gmail_service(credentials_file: str = CREDENTIALS_FILE, token_file: str = TOKEN_FILE):
     creds = None
     if os.path.exists(token_file):
@@ -91,22 +84,10 @@ def get_gmail_service(credentials_file: str = CREDENTIALS_FILE, token_file: str 
             creds = flow.run_local_server(port=0)
             with open(token_file, "w") as f:
                 f.write(creds.to_json())
-            logging.info("Saved OAuth token to %s (do NOT commit).", token_file)
     service = build("gmail", "v1", credentials=creds)
     return service
 
 
-# ---------- Model loading ----------
-def load_model_and_vectorizer(model_path: str = MODEL_PATH, vec_path: str = VEC_PATH):
-    if not os.path.exists(model_path) or not os.path.exists(vec_path):
-        raise FileNotFoundError(f"Model or vectorizer not found. Expected {model_path} and {vec_path}")
-    logging.info("Loading model and vectorizer from %s and %s ...", model_path, vec_path)
-    model = joblib.load(model_path)
-    vectorizer = joblib.load(vec_path)
-    return model, vectorizer
-
-
-# ---------- Gmail message extraction ----------
 def extract_text_from_payload(payload) -> str:
     if not payload:
         return ""
@@ -127,6 +108,7 @@ def extract_text_from_payload(payload) -> str:
 
     if "parts" not in payload:
         return decode_part(payload) or ""
+    # prefer text/plain, fallback to text/html
     texts = []
     for part in payload.get("parts", []):
         mime = part.get("mimeType", "")
@@ -142,6 +124,7 @@ def extract_text_from_payload(payload) -> str:
             txt = decode_part(part)
             if txt:
                 return strip_html_and_unescape(txt)
+    # nested fallback
     for part in payload.get("parts", []):
         if "parts" in part:
             txt = extract_text_from_payload(part)
@@ -165,7 +148,17 @@ def message_to_text(msg_full) -> Tuple[str, str]:
     return subj, combined
 
 
-# ---------- Gmail actions ----------
+# ---------- Model helpers ----------
+def load_model_and_vectorizer(model_path: str = MODEL_PATH, vec_path: str = VEC_PATH):
+    if not os.path.exists(model_path) or not os.path.exists(vec_path):
+        raise FileNotFoundError(f"Model or vectorizer not found. Run trainer first.")
+    logging.info("Loading model and vectorizer...")
+    model = joblib.load(model_path)
+    vectorizer = joblib.load(vec_path)
+    return model, vectorizer
+
+
+# ---------- Actions ----------
 def fetch_unread_inbox_message_ids(service) -> List[str]:
     resp = service.users().messages().list(userId="me", q="in:inbox is:unread").execute()
     msgs = resp.get("messages", []) or []
@@ -182,146 +175,80 @@ def add_labels_move_to_spam(service, msg_id: str):
     mods = {"addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX", "UNREAD"]}
     try:
         service.users().messages().modify(userId="me", id=msg_id, body=mods).execute()
-        logging.info("Message %s: added SPAM label and removed INBOX/UNREAD", msg_id)
+        logging.info("Moved message %s to SPAM", msg_id)
     except Exception as e:
         logging.error("Failed to modify labels for %s: %s", msg_id, e)
 
 
-def save_eml_quarantine(service, msg_id: str, dest_dir: str = DEBUG_DIR):
+def save_eml_quarantine(service, msg_id: str, dest_dir: str = "gmail_debug"):
     try:
         resp = service.users().messages().get(userId="me", id=msg_id, format="raw").execute()
     except Exception as e:
         logging.error("Failed to fetch raw message for %s: %s", msg_id, e)
         return
-    # resp may be None or not contain 'raw'
-    if not resp or not isinstance(resp, dict):
-        logging.warning("No response or unexpected format when fetching raw for %s", msg_id)
-        return
-    raw_b64 = resp.get("raw")
+    raw_b64 = resp.get("raw") if isinstance(resp, dict) else None
     if not raw_b64:
-        logging.warning("No 'raw' field present in Gmail API response for %s; skipping quarantine save.", msg_id)
+        logging.warning("No raw data for %s, skipping quarantine save.", msg_id)
         return
     try:
         decoded = base64.urlsafe_b64decode(raw_b64.encode("ASCII"))
-    except Exception as e:
-        logging.error("Failed to decode raw base64 for %s: %s", msg_id, e)
-        return
-    try:
         os.makedirs(dest_dir, exist_ok=True)
-        fn = os.path.join(dest_dir, f"{msg_id}.eml")
-        with open(fn, "wb") as f:
+        with open(os.path.join(dest_dir, f"{msg_id}.eml"), "wb") as f:
             f.write(decoded)
-        logging.info("Saved quarantine copy to %s", fn)
+        logging.info("Saved quarantine copy for %s", msg_id)
     except Exception as e:
-        logging.error("Failed to write quarantine file for %s: %s", msg_id, e)
+        logging.error("Failed to save quarantine for %s: %s", msg_id, e)
 
 
 # ---------- Processing ----------
-def process_messages(service, model, vectorizer, message_ids: List[str], save_csv: Optional[str] = PREDICTIONS_CSV):
+def process_messages(service, model, vectorizer, message_ids: List[str]):
     rows = []
     for mid in message_ids:
+        full = get_full_message(service, mid)
+        if full is None:
+            continue
+        subj, combined = message_to_text(full)
+        if not combined.strip():
+            logging.info("Skipping empty message %s", mid)
+            rows.append({"message_id": mid, "subject": subj, "spam_prob": 0.0, "pred": 0})
+            continue
+        text_proc = simple_preprocess(combined)
+        X = vectorizer.transform([text_proc])
         try:
-            full = get_full_message(service, mid)
-            if full is None:
-                logging.warning("Message %s returned None for full fetch — skipping.", mid)
-                continue
-            subj, combined = message_to_text(full)
-            if not combined.strip():
-                logging.info("Message %s appears empty after extraction; skipping.", mid)
-                rows.append({"message_id": mid, "subject": subj, "spam_prob": 0.0, "pred": 0})
-                continue
-            text_proc = simple_preprocess(combined)
-            X = vectorizer.transform([text_proc])
-            try:
-                prob = float(model.predict_proba(X)[:, 1][0])
-            except Exception:
-                # fallback to decision_function (sigmoid)
-                try:
-                    score = model.decision_function(X)
-                    import math
-                    prob = 1.0 / (1.0 + math.exp(-float(score)))
-                except Exception:
-                    logging.exception("Model doesn't support predict_proba or decision_function; defaulting prob=0.0")
-                    prob = 0.0
-            pred = int(prob >= SPAM_PROB_THRESHOLD)
-            logging.info("Msg %s | subj=%s | prob=%.4f pred=%d", mid, subj[:80], prob, pred)
-            rows.append({"message_id": mid, "subject": subj, "spam_prob": prob, "pred": pred})
-            if pred == 1:
-                if QUARANTINE_SAVE:
-                    save_eml_quarantine(service, mid)
-                add_labels_move_to_spam(service, mid)
-        except Exception as e:
-            logging.error("Failed processing message %s: %s\n%s", mid, e, traceback.format_exc())
-            # continue to next message
-    df = pd.DataFrame(rows)
-    if not df.empty and save_csv:
-        try:
-            if os.path.exists(save_csv):
-                df.to_csv(save_csv, mode="a", header=False, index=False)
-            else:
-                df.to_csv(save_csv, index=False)
-            logging.info("Saved predictions to %s", save_csv)
-        except Exception as e:
-            logging.error("Failed to save predictions CSV: %s", e)
-    # debug when nothing flagged
-    if not df.empty and df['pred'].sum() == 0:
-        logging.warning("All predictions are 0 (no spam detected). Writing debug artifacts.")
-        try:
-            os.makedirs(DEBUG_DIR, exist_ok=True)
-            stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-            df.to_csv(os.path.join(DEBUG_DIR, f"predictions_debug_{stamp}.csv"), index=False)
-            try:
-                coef = None
-                if hasattr(model, "coef_"):
-                    coef = model.coef_
-                elif hasattr(model, "named_steps"):
-                    final = list(model.named_steps.items())[-1][1]
-                    if hasattr(final, "coef_"):
-                        coef = final.coef_
-                if coef is not None:
-                    feat_names = vectorizer.get_feature_names_out() if hasattr(vectorizer,
-                                                                               "get_feature_names_out") \
-                        else vectorizer.get_feature_names()
-                    import numpy as np
-                    coefs = coef.ravel()
-                    top_pos_idx = np.argsort(-coefs)[:40]
-                    top_neg_idx = np.argsort(coefs)[:40]
-                    with open(os.path.join(DEBUG_DIR, f"token_debug_{stamp}.txt"), "w", encoding="utf-8") as f:
-                        f.write("Top positive tokens (spam):\n")
-                        for i in top_pos_idx:
-                            f.write(f"{feat_names[i]}\t{coefs[i]:.6f}\n")
-                        f.write("\nTop negative tokens (ham):\n")
-                        for i in top_neg_idx:
-                            f.write(f"{feat_names[i]}\t{coefs[i]:.6f}\n")
-                    logging.info("Wrote token debug to %s", os.path.join(DEBUG_DIR, f"token_debug_{stamp}.txt"))
-            except Exception:
-                logging.exception("Failed while writing token debug.")
+            prob = float(model.predict_proba(X)[:, 1][0])
         except Exception:
-            logging.exception("Failed while writing debug artifacts.")
-    return df
+            # fallback: if model lacks predict_proba, default 0.0
+            prob = 0.0
+        pred = int(prob >= SPAM_PROB_THRESHOLD)
+        logging.info("Msg %s | subj=%s | prob=%.3f pred=%d", mid, subj[:80], prob, pred)
+        rows.append({"message_id": mid, "subject": subj, "spam_prob": prob, "pred": pred})
+        if pred == 1:
+            if QUARANTINE_SAVE:
+                save_eml_quarantine(service, mid)
+            add_labels_move_to_spam(service, mid)
+    # append predictions
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        if os.path.exists(PREDICTIONS_CSV):
+            df.to_csv(PREDICTIONS_CSV, mode="a", header=False, index=False)
+        else:
+            df.to_csv(PREDICTIONS_CSV, index=False)
+        logging.info("Saved predictions to %s", PREDICTIONS_CSV)
+        CSV = pd.read_csv(PREDICTIONS_CSV)
+        print("Number of Spam: ", int(CSV["pred"].sum()))
+        print("Number of Preprocessed Messages: ", int(CSV["message_id"].count()))
 
 
 # ---------- Main ----------
 def main():
-    try:
-        model, vectorizer = load_model_and_vectorizer(MODEL_PATH, VEC_PATH)
-    except Exception as e:
-        logging.error("Model load error: %s", e)
+    model, vectorizer = load_model_and_vectorizer()
+    service = get_gmail_service()
+    msg_ids = fetch_unread_inbox_message_ids(service)
+    if not msg_ids:
+        logging.info("No unread messages.")
         return
-    try:
-        service = get_gmail_service()
-    except Exception as e:
-        logging.error("Gmail service error: %s", e)
-        return
-    try:
-        msg_ids = fetch_unread_inbox_message_ids(service)
-        if not msg_ids:
-            logging.info("No unread messages found.")
-            return
-        df = process_messages(service, model, vectorizer, msg_ids)
-        logging.info("Processing complete. %d messages handled. Spam flagged: %d", len(df), int(df['pred'].sum()))
-    except Exception as e:
-        logging.error("Processing error: %s\n%s", e, traceback.format_exc())
+    process_messages(service, model, vectorizer, msg_ids)
+    logging.info("Run complete.")
 
 
 if __name__ == "__main__":
