@@ -34,6 +34,3 @@ This repository contains two tools:
   python gmail_spam_monitor.py
   ```
   Approve the consent screen in the browser. This creates token.json.
-
-5. 
-
